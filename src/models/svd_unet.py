@@ -95,6 +95,9 @@ class StableVideoUNet(nn.Module):
         model_id: str = "stabilityai/stable-video-diffusion-img2vid-xt",
         timesteps: Sequence[int] | None = None,
         torch_dtype: torch.dtype = torch.float16,
+        enable_memory_efficient_attention: bool = True,
+        enable_sliced_attention: bool = False,
+        attention_slice_size: int | str = "auto",
         **kwargs,
     ) -> StableVideoUNet:
         """Load a pretrained SVD UNet and wrap it.
@@ -103,6 +106,9 @@ class StableVideoUNet(nn.Module):
             model_id: HuggingFace model ID or local path
             timesteps: Optional timestep schedule (will be generated if None)
             torch_dtype: Model loading dtype
+            enable_memory_efficient_attention: Use xformers or PyTorch 2.0 attention
+            enable_sliced_attention: Use attention slicing to reduce memory
+            attention_slice_size: Slice size for attention ("auto", "max", or int)
             **kwargs: Additional arguments passed to from_pretrained
 
         Returns:
@@ -117,12 +123,63 @@ class StableVideoUNet(nn.Module):
             **kwargs,
         )
 
+        # Apply memory optimizations
+        if enable_memory_efficient_attention:
+            try:
+                # Try xformers first
+                unet.enable_xformers_memory_efficient_attention()
+            except Exception:
+                # Fallback: try to set attention backend for PyTorch 2.0
+                try:
+                    if hasattr(unet, "set_attention_backend"):
+                        unet.set_attention_backend("flash_attention_2")
+                except Exception:
+                    pass  # Use default attention
+
+        if enable_sliced_attention:
+            # Note: attention slicing may not be available for all models
+            try:
+                if hasattr(unet, "set_attention_slice"):
+                    unet.set_attention_slice(attention_slice_size)
+            except Exception:
+                pass  # Slicing not supported
+
         # Default timestep schedule if not provided
         if timesteps is None:
             # Default 25-step schedule matching Euler discrete
             timesteps = cls._default_timestep_schedule(num_steps=25)
 
         return cls(unet=unet, timesteps=timesteps, dtype=torch_dtype)
+
+    def enable_memory_optimizations(self) -> None:
+        """Enable memory optimizations on the UNet.
+
+        This method tries multiple strategies:
+        1. xformers memory efficient attention
+        2. Flash attention backend
+        3. Gradient checkpointing
+        """
+        # Try xformers
+        try:
+            self.unet.enable_xformers_memory_efficient_attention()
+            return
+        except Exception:
+            pass
+
+        # Try flash attention backend
+        try:
+            if hasattr(self.unet, "set_attention_backend"):
+                self.unet.set_attention_backend("flash_attention_2")
+                return
+        except Exception:
+            pass
+
+        # Enable gradient checkpointing for memory savings
+        try:
+            if hasattr(self.unet, "enable_gradient_checkpointing"):
+                self.unet.enable_gradient_checkpointing()
+        except Exception:
+            pass
 
     @staticmethod
     def _default_timestep_schedule(

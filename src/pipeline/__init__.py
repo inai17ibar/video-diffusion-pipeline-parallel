@@ -1,5 +1,5 @@
+from .pipeline import LatentSpec, PipelineConfig, PipelineStage, run_single_latent
 from .step_assignment import StepRange, assign_steps
-from .pipeline import LatentSpec, run_single_latent, PipelineStage, PipelineConfig
 
 __all__ = [
     "StepRange",

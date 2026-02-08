@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence
+from typing import Callable
 
 import torch
 import torch.distributed as dist
@@ -57,7 +58,7 @@ class PipelineStage:
         self,
         model,
         config: PipelineConfig,
-        logger: Optional[logging.Logger] = None,
+        logger: logging.Logger | None = None,
     ) -> None:
         self.model = model
         self.config = config
@@ -83,7 +84,7 @@ class PipelineStage:
         dist.send(latent, dst=self.config.rank + 1, tag=self.config.send_tag)
 
     def _run_local_steps(self, latent: torch.Tensor) -> torch.Tensor:
-        local_timesteps: List[int] = list(
+        local_timesteps: list[int] = list(
             self.config.timesteps[self.step_range.start : self.step_range.end]
         )
         if len(local_timesteps) != self.step_range.count:
@@ -96,7 +97,7 @@ class PipelineStage:
             self._log(f"step {step} completed in {elapsed_ms:.2f} ms")
         return latent
 
-    def run(self, input_latent: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    def run(self, input_latent: torch.Tensor | None) -> torch.Tensor | None:
         """Execute the stage and forward the latent downstream.
 
         Args:
@@ -113,15 +114,13 @@ class PipelineStage:
         self,
         num_samples: int,
         *,
-        input_supplier: Optional[InputSupplier] = None,
-    ) -> Optional[List[torch.Tensor]]:
+        input_supplier: InputSupplier | None = None,
+    ) -> list[torch.Tensor] | None:
         if num_samples <= 0:
             raise ValueError("num_samples must be positive for pipeline execution")
         if self.config.rank == 0 and input_supplier is None:
-            raise ValueError(
-                "rank 0 requires an input_supplier when processing multiple samples"
-            )
-        outputs: List[torch.Tensor] = []
+            raise ValueError("rank 0 requires an input_supplier when processing multiple samples")
+        outputs: list[torch.Tensor] = []
         for sample_idx in range(num_samples):
             latent = self._process_single_latent(
                 input_supplier(sample_idx) if self.config.rank == 0 else None,
@@ -133,8 +132,8 @@ class PipelineStage:
         return outputs if outputs else None
 
     def _process_single_latent(
-        self, input_latent: Optional[torch.Tensor], sample_idx: Optional[int]
-    ) -> Optional[torch.Tensor]:
+        self, input_latent: torch.Tensor | None, sample_idx: int | None
+    ) -> torch.Tensor | None:
         prefix = f"sample {sample_idx} " if sample_idx is not None else ""
 
         if self.config.rank == 0:
@@ -166,9 +165,9 @@ def run_single_latent(
     world_size: int,
     rank: int,
     latent_spec: LatentSpec,
-    input_latent: Optional[torch.Tensor],
-    logger: Optional[logging.Logger] = None,
-) -> Optional[torch.Tensor]:
+    input_latent: torch.Tensor | None,
+    logger: logging.Logger | None = None,
+) -> torch.Tensor | None:
     """Convenience entrypoint used by mode scripts.
 
     All ranks should call this function once per latent. Rank 0 passes the
@@ -195,9 +194,9 @@ def run_pipeline_latents(
     rank: int,
     latent_spec: LatentSpec,
     num_samples: int,
-    input_supplier: Optional[InputSupplier],
-    logger: Optional[logging.Logger] = None,
-) -> Optional[List[torch.Tensor]]:
+    input_supplier: InputSupplier | None,
+    logger: logging.Logger | None = None,
+) -> list[torch.Tensor] | None:
     config = PipelineConfig(
         total_steps=total_steps,
         world_size=world_size,

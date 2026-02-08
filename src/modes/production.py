@@ -34,6 +34,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--motion-bucket-id", type=int, default=127, help="Motion bucket ID (0-255)"
     )
+    parser.add_argument(
+        "--enable-memory-opt",
+        action="store_true",
+        help="Enable memory optimizations (xformers/attention slicing)",
+    )
+    parser.add_argument(
+        "--attention-slicing",
+        action="store_true",
+        help="Enable attention slicing for reduced memory",
+    )
     return parser.parse_args()
 
 
@@ -82,7 +92,14 @@ def main() -> None:
         model_id=args.model_id,
         timesteps=timesteps,
         torch_dtype=torch.float16,
+        enable_memory_efficient_attention=args.enable_memory_opt,
+        enable_sliced_attention=args.attention_slicing,
     ).to(device)
+
+    # Apply additional memory optimizations if requested
+    if args.enable_memory_opt:
+        model.enable_memory_optimizations()
+        LOGGER.info("Memory optimizations enabled on rank %d", rank)
 
     # Set dummy conditioning for benchmarking
     # latent_shape is (B, C, F, H, W) where C should be 4
