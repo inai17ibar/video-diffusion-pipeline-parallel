@@ -6,7 +6,7 @@ the simple interface expected by the pipeline executor.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
@@ -19,10 +19,19 @@ class StableVideoUNet(nn.Module):
     forward(latent, step) -> latent signature and the more complex
     diffusers SVD UNet interface.
 
+    The SVD UNet expects 8-channel input:
+    - 4 channels: noisy latent z_t
+    - 4 channels: encoded conditioning image (repeated for each frame)
+
+    This wrapper handles:
+    - Channel concatenation for UNet input
+    - Scheduler step to compute z_{t-1} from noise prediction
+    - Shape transposition between pipeline and diffusers conventions
+
     Shape Convention:
-        Pipeline uses (B, C, F, H, W)
-        Diffusers uses (B, F, C, H, W)
-        This wrapper handles the transposition automatically.
+        Pipeline uses (B, C, F, H, W) with C=4
+        Diffusers uses (B, F, C, H, W) with C=8 (concatenated)
+        This wrapper handles the transposition and concatenation automatically.
 
     Attributes:
         unet: The underlying UNetSpatioTemporalConditionModel
@@ -34,6 +43,7 @@ class StableVideoUNet(nn.Module):
         unet: nn.Module,
         timesteps: Sequence[int],
         dtype: torch.dtype = torch.float16,
+        num_train_timesteps: int = 1000,
     ) -> None:
         """Initialize the wrapper.
 
@@ -41,25 +51,52 @@ class StableVideoUNet(nn.Module):
             unet: Pre-loaded UNetSpatioTemporalConditionModel instance
             timesteps: Full diffusion timestep schedule (length = total_steps)
             dtype: Computation dtype (default fp16 for inference)
+            num_train_timesteps: Number of training timesteps for scheduler
         """
         super().__init__()
         self.unet = unet
         self.timesteps = list(timesteps)
         self.dtype = dtype
+        self.num_train_timesteps = num_train_timesteps
+
+        # Precompute scheduler parameters (Euler Discrete)
+        self._init_scheduler_params()
 
         # Conditioning buffers - registered but not persistent
         self.register_buffer("_image_embeddings", None, persistent=False)
         self.register_buffer("_added_time_ids", None, persistent=False)
+        self.register_buffer("_image_latents", None, persistent=False)
         self._conditioning_set = False
+
+    def _init_scheduler_params(self) -> None:
+        """Initialize Euler Discrete scheduler parameters."""
+        # Linear beta schedule
+        beta_start = 0.00085
+        beta_end = 0.012
+        betas = torch.linspace(beta_start, beta_end, self.num_train_timesteps)
+        alphas = 1.0 - betas
+        self.register_buffer(
+            "_alphas_cumprod",
+            torch.cumprod(alphas, dim=0),
+            persistent=False,
+        )
+
+        # Compute sigmas for Euler scheduler
+        sigmas = ((1 - self._alphas_cumprod) / self._alphas_cumprod) ** 0.5
+        self.register_buffer("_sigmas", sigmas, persistent=False)
+
+    def _get_sigma(self, timestep: int) -> torch.Tensor:
+        """Get sigma value for a given timestep."""
+        return self._sigmas[timestep]
 
     @classmethod
     def from_pretrained(
         cls,
         model_id: str = "stabilityai/stable-video-diffusion-img2vid-xt",
-        timesteps: Optional[Sequence[int]] = None,
+        timesteps: Sequence[int] | None = None,
         torch_dtype: torch.dtype = torch.float16,
         **kwargs,
-    ) -> "StableVideoUNet":
+    ) -> StableVideoUNet:
         """Load a pretrained SVD UNet and wrap it.
 
         Args:
@@ -108,6 +145,7 @@ class StableVideoUNet(nn.Module):
     def set_conditioning(
         self,
         image_embeddings: torch.Tensor,
+        image_latents: torch.Tensor,
         fps: int = 6,
         motion_bucket_id: int = 127,
         noise_aug_strength: float = 0.02,
@@ -119,6 +157,7 @@ class StableVideoUNet(nn.Module):
 
         Args:
             image_embeddings: CLIP image embeddings (B, 1, 1024) or (B, 1024)
+            image_latents: Encoded conditioning image (B, C, F, H, W) with C=4
             fps: Frames per second (will subtract 1 internally)
             motion_bucket_id: Motion bucket ID (typically 127)
             noise_aug_strength: Noise augmentation strength
@@ -141,11 +180,15 @@ class StableVideoUNet(nn.Module):
         # Register as buffers for proper device handling
         self._image_embeddings = image_embeddings.to(self.dtype)
         self._added_time_ids = added_time_ids
+        self._image_latents = image_latents.to(self.dtype)
         self._conditioning_set = True
 
     def set_dummy_conditioning(
         self,
         batch_size: int,
+        num_frames: int,
+        height: int,
+        width: int,
         device: torch.device,
         fps: int = 6,
         motion_bucket_id: int = 127,
@@ -153,11 +196,14 @@ class StableVideoUNet(nn.Module):
     ) -> None:
         """Set dummy conditioning for benchmarking purposes.
 
-        This generates random image embeddings for testing without
-        requiring an actual CLIP encoder.
+        This generates random image embeddings and latents for testing without
+        requiring an actual CLIP encoder or VAE.
 
         Args:
             batch_size: Batch size for conditioning tensors
+            num_frames: Number of video frames
+            height: Latent height
+            width: Latent width
             device: Device to create tensors on
             fps: Frames per second
             motion_bucket_id: Motion bucket ID
@@ -165,12 +211,28 @@ class StableVideoUNet(nn.Module):
         """
         # Generate random CLIP-like embeddings
         image_embeddings = torch.randn(
-            batch_size, 1, 1024,
+            batch_size,
+            1,
+            1024,
             device=device,
             dtype=self.dtype,
         )
+
+        # Generate random image latents (4 channels, repeated for all frames)
+        # Shape: (B, C=4, F, H, W)
+        image_latents = torch.randn(
+            batch_size,
+            4,
+            num_frames,
+            height,
+            width,
+            device=device,
+            dtype=self.dtype,
+        )
+
         self.set_conditioning(
             image_embeddings=image_embeddings,
+            image_latents=image_latents,
             fps=fps,
             motion_bucket_id=motion_bucket_id,
             noise_aug_strength=noise_aug_strength,
@@ -180,17 +242,18 @@ class StableVideoUNet(nn.Module):
         """Clear the conditioning state."""
         self._image_embeddings = None
         self._added_time_ids = None
+        self._image_latents = None
         self._conditioning_set = False
 
     def forward(self, latent: torch.Tensor, step: int) -> torch.Tensor:
-        """Execute a single diffusion step.
+        """Execute a single diffusion step with scheduler update.
 
         Args:
-            latent: Noisy latent tensor (B, C, F, H, W)
+            latent: Noisy latent tensor (B, C=4, F, H, W)
             step: Step index into the timestep schedule
 
         Returns:
-            Denoised latent tensor (B, C, F, H, W)
+            Denoised latent tensor (B, C=4, F, H, W)
 
         Raises:
             RuntimeError: If set_conditioning() was not called
@@ -203,18 +266,21 @@ class StableVideoUNet(nn.Module):
 
         # Validate step index
         if not (0 <= step < len(self.timesteps)):
-            raise ValueError(
-                f"Step {step} out of range [0, {len(self.timesteps)})"
-            )
+            raise ValueError(f"Step {step} out of range [0, {len(self.timesteps)})")
 
         # Map step index to actual timestep value
         timestep = self.timesteps[step]
 
-        # Transpose: (B, C, F, H, W) -> (B, F, C, H, W)
-        sample = latent.permute(0, 2, 1, 3, 4).to(self.dtype)
+        # Concatenate latent with image_latents along channel dimension
+        # latent: (B, 4, F, H, W), image_latents: (B, 4, F, H, W)
+        # Result: (B, 8, F, H, W)
+        latent_model_input = torch.cat([latent, self._image_latents], dim=1)
 
-        # Forward through the actual UNet
-        output = self.unet(
+        # Transpose: (B, C=8, F, H, W) -> (B, F, C=8, H, W)
+        sample = latent_model_input.permute(0, 2, 1, 3, 4).to(self.dtype)
+
+        # Forward through the actual UNet - returns noise prediction
+        noise_pred = self.unet(
             sample=sample,
             timestep=timestep,
             encoder_hidden_states=self._image_embeddings,
@@ -222,7 +288,22 @@ class StableVideoUNet(nn.Module):
             return_dict=False,
         )[0]
 
-        # Transpose back: (B, F, C, H, W) -> (B, C, F, H, W)
-        result = output.permute(0, 2, 1, 3, 4)
+        # Transpose back: (B, F, C=4, H, W) -> (B, C=4, F, H, W)
+        noise_pred = noise_pred.permute(0, 2, 1, 3, 4)
 
-        return result
+        # Apply Euler scheduler step to get z_{t-1}
+        # Simplified Euler step: z_{t-1} = z_t - sigma * noise_pred
+        sigma = self._get_sigma(timestep).to(latent.device)
+
+        # Get next sigma (or 0 if this is the last step)
+        if step < len(self.timesteps) - 1:
+            next_timestep = self.timesteps[step + 1]
+            sigma_next = self._get_sigma(next_timestep).to(latent.device)
+        else:
+            sigma_next = torch.tensor(0.0, device=latent.device)
+
+        # Euler step
+        dt = sigma_next - sigma
+        latent_next = latent + dt * noise_pred
+
+        return latent_next

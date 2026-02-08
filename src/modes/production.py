@@ -85,9 +85,16 @@ def main() -> None:
     ).to(device)
 
     # Set dummy conditioning for benchmarking
+    # latent_shape is (B, C, F, H, W) where C should be 4
     batch_size = args.latent_shape[0] if args.latent_shape else 1
+    num_frames = args.latent_shape[2] if args.latent_shape else 14
+    height = args.latent_shape[3] if args.latent_shape else 64
+    width = args.latent_shape[4] if args.latent_shape else 64
     model.set_dummy_conditioning(
         batch_size=batch_size,
+        num_frames=num_frames,
+        height=height,
+        width=width,
         device=device,
         fps=args.fps,
         motion_bucket_id=args.motion_bucket_id,
