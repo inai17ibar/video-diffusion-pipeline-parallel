@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -66,6 +66,10 @@ def _discover_rank(default_rank: int) -> int:
     return int(os.environ.get("RANK", default_rank))
 
 
+def _discover_local_rank(default_local_rank: int = 0) -> int:
+    return int(os.environ.get("LOCAL_RANK", default_local_rank))
+
+
 def _discover_world_size(default_world_size: int) -> int:
     return int(os.environ.get("WORLD_SIZE", default_world_size))
 
@@ -90,7 +94,10 @@ def _build_initial_latent(args, device: torch.device, dtype: torch.dtype) -> tor
 
 def main() -> None:
     args = _parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     rank = _discover_rank(args.rank)
     world_size = _discover_world_size(args.world_size)
@@ -98,14 +105,35 @@ def main() -> None:
     backend_pref = None if args.backend == "auto" else args.backend
     backend = resolve_backend(backend_pref, simulator=True)
 
-    init_distributed(backend=backend, rank=rank, world_size=world_size, init_method=args.init_method)
+    init_distributed(
+        backend=backend, rank=rank, world_size=world_size, init_method=args.init_method
+    )
 
     dtype = _str_to_dtype(args.dtype)
-    device = torch.device(args.device)
+
+    # Handle device assignment for multi-GPU
+    local_rank = _discover_local_rank()
+    if args.device == "cuda":
+        # Use local_rank to assign each process to a different GPU
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(args.device)
 
     model = DummyUNet(channels=args.latent_channels).to(device)
     timesteps = _build_timesteps(args.total_steps)
-    latent_spec = LatentSpec(shape=torch.Size((args.latent_batch, args.latent_channels, args.latent_frames, args.latent_height, args.latent_width)), dtype=dtype, device=device)
+    latent_spec = LatentSpec(
+        shape=torch.Size(
+            (
+                args.latent_batch,
+                args.latent_channels,
+                args.latent_frames,
+                args.latent_height,
+                args.latent_width,
+            )
+        ),
+        dtype=dtype,
+        device=device,
+    )
 
     input_latent = None
     if rank == 0:

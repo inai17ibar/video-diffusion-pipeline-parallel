@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 
@@ -27,14 +27,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--backend", type=str, default="auto")
     parser.add_argument("--init-method", type=str, default=None)
-    parser.add_argument("--model-id", type=str, default="stabilityai/stable-video-diffusion-img2vid-xt")
+    parser.add_argument(
+        "--model-id", type=str, default="stabilityai/stable-video-diffusion-img2vid-xt"
+    )
     parser.add_argument("--fps", type=int, default=6, help="Frames per second for conditioning")
-    parser.add_argument("--motion-bucket-id", type=int, default=127, help="Motion bucket ID (0-255)")
+    parser.add_argument(
+        "--motion-bucket-id", type=int, default=127, help="Motion bucket ID (0-255)"
+    )
     return parser.parse_args()
 
 
 def _discover_rank() -> int:
     return int(os.environ["RANK"])
+
+
+def _discover_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
 
 
 def _discover_world_size() -> int:
@@ -43,13 +51,17 @@ def _discover_world_size() -> int:
 
 def main() -> None:
     args = _parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     rank = _discover_rank()
+    local_rank = _discover_local_rank()
     world_size = _discover_world_size()
 
     backend = resolve_backend(None if args.backend == "auto" else args.backend, simulator=False)
-    device = torch.device(f"cuda:{rank}")
+    device = torch.device(f"cuda:{local_rank}")
 
     init_distributed(
         backend=backend,
@@ -82,7 +94,9 @@ def main() -> None:
     )
     LOGGER.info("Model loaded and conditioning set on rank %d", rank)
 
-    latent_spec = LatentSpec(shape=torch.Size(tuple(args.latent_shape)), dtype=torch.float16, device=device)
+    latent_spec = LatentSpec(
+        shape=torch.Size(tuple(args.latent_shape)), dtype=torch.float16, device=device
+    )
 
     def _input_supplier(sample_idx: int) -> torch.Tensor:
         torch.manual_seed(args.seed + sample_idx)
