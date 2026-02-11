@@ -31,18 +31,29 @@ LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate video from image using pipeline parallel")
+    parser = argparse.ArgumentParser(
+        description="Generate video from image using pipeline parallel"
+    )
     parser.add_argument("--input-image", type=str, required=True, help="Path to input image")
     parser.add_argument("--output-dir", type=str, default="outputs", help="Output directory")
     parser.add_argument("--total-steps", type=int, default=25, help="Number of diffusion steps")
     parser.add_argument("--num-frames", type=int, default=14, help="Number of video frames")
     parser.add_argument("--fps", type=int, default=7, help="Output video FPS")
-    parser.add_argument("--motion-bucket-id", type=int, default=127, help="Motion bucket ID (0-255)")
-    parser.add_argument("--noise-aug-strength", type=float, default=0.02, help="Noise augmentation strength")
+    parser.add_argument(
+        "--motion-bucket-id", type=int, default=127, help="Motion bucket ID (0-255)"
+    )
+    parser.add_argument(
+        "--noise-aug-strength", type=float, default=0.02, help="Noise augmentation strength"
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--height", type=int, default=576, help="Output height")
     parser.add_argument("--width", type=int, default=1024, help="Output width")
-    parser.add_argument("--model-id", type=str, default="stabilityai/stable-video-diffusion-img2vid-xt")
+    parser.add_argument(
+        "--guidance-scale", type=float, default=3.0, help="CFG guidance scale (1.0 disables CFG)"
+    )
+    parser.add_argument(
+        "--model-id", type=str, default="stabilityai/stable-video-diffusion-img2vid-xt"
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args()
 
@@ -56,17 +67,29 @@ def discover_distributed_info() -> tuple[int, int, bool]:
     return rank, world_size, local_rank, is_distributed
 
 
-def load_and_preprocess_image(image_path: str, height: int, width: int) -> "Image.Image":
-    """Load and preprocess input image."""
+def load_and_preprocess_image(image_path: str, height: int, width: int):
+    """Load and preprocess input image using center crop (no aspect ratio distortion)."""
     from PIL import Image
 
     image = Image.open(image_path).convert("RGB")
-    image = image.resize((width, height), Image.LANCZOS)
+    src_w, src_h = image.size
+
+    # Scale so the shorter side matches the target, then center crop
+    scale = max(width / src_w, height / src_h)
+    new_w = round(src_w * scale)
+    new_h = round(src_h * scale)
+    if (new_w, new_h) != (src_w, src_h):
+        image = image.resize((new_w, new_h), Image.LANCZOS)
+
+    # Center crop to exact target size
+    left = (new_w - width) // 2
+    top = (new_h - height) // 2
+    image = image.crop((left, top, left + width, top + height))
     return image
 
 
 def encode_image(
-    image: "Image.Image",
+    image,
     image_encoder: torch.nn.Module,
     feature_extractor,
     vae: torch.nn.Module,
@@ -75,9 +98,13 @@ def encode_image(
     num_frames: int,
     noise_aug_strength: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Encode image to CLIP embeddings and VAE latents."""
-    import torch.nn.functional as F
+    """Encode image to CLIP embeddings and VAE latents.
 
+    Follows the official diffusers SVDPipeline convention:
+    - CLIP embeddings: standard image encoding
+    - VAE latents: encode with noise augmentation in pixel space, NO scaling_factor,
+      use .mode() for deterministic encoding
+    """
     # CLIP image encoding
     inputs = feature_extractor(images=image, return_tensors="pt")
     pixel_values = inputs.pixel_values.to(device, dtype=dtype)
@@ -86,23 +113,26 @@ def encode_image(
         image_embeddings = image_encoder(pixel_values).image_embeds
         image_embeddings = image_embeddings.unsqueeze(1)  # (B, 1, 1024)
 
-    # VAE encoding
+    # VAE encoding (matching official diffusers pipeline)
     from torchvision import transforms
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5]),
-    ])
+    transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
     image_tensor = transform(image).unsqueeze(0).to(device, dtype=dtype)
 
-    with torch.no_grad():
-        image_latents = vae.encode(image_tensor).latent_dist.sample()
-        image_latents = image_latents * vae.config.scaling_factor
-
-    # Add noise augmentation
+    # Add noise augmentation in PIXEL space (before VAE encoding)
     if noise_aug_strength > 0:
-        noise = torch.randn_like(image_latents)
-        image_latents = image_latents + noise_aug_strength * noise
+        noise = torch.randn_like(image_tensor)
+        image_tensor = image_tensor + noise_aug_strength * noise
+
+    with torch.no_grad():
+        # Use .mode() for deterministic encoding (official pipeline convention)
+        # Do NOT multiply by scaling_factor — image_latents are raw VAE latents
+        image_latents = vae.encode(image_tensor).latent_dist.mode()
 
     # Repeat for all frames: (B, C, H, W) -> (B, C, F, H, W)
     image_latents = image_latents.unsqueeze(2).repeat(1, 1, num_frames, 1, 1)
@@ -114,21 +144,35 @@ def decode_latents(
     latents: torch.Tensor,
     vae: torch.nn.Module,
     num_frames: int,
+    decode_chunk_size: int = 14,
 ) -> torch.Tensor:
-    """Decode latents to video frames."""
-    # latents: (B, C, F, H, W) -> decode each frame
+    """Decode latents to video frames.
+
+    Follows the official diffusers SVDPipeline convention:
+    - Decode all frames at once (or in chunks) so the temporal decoder can work
+    - Apply 1/scaling_factor before decoding
+    """
+    # latents: (B, C, F, H, W) -> (B, F, C, H, W) -> (B*F, C, H, W)
+    latents = latents.permute(0, 2, 1, 3, 4)  # (B, F, C, H, W)
+    batch_size = latents.shape[0]
+    latents = latents.flatten(0, 1)  # (B*F, C, H, W)
     latents = latents / vae.config.scaling_factor
 
+    # Decode in chunks (all frames together for temporal coherence)
     frames = []
-    for i in range(num_frames):
-        frame_latent = latents[:, :, i, :, :]  # (B, C, H, W)
-        with torch.no_grad():
-            frame = vae.decode(frame_latent).sample
-        frames.append(frame)
+    with torch.no_grad():
+        for i in range(0, latents.shape[0], decode_chunk_size):
+            chunk = latents[i : i + decode_chunk_size]
+            frame = vae.decode(chunk, num_frames=chunk.shape[0]).sample
+            frames.append(frame)
+    frames = torch.cat(frames, dim=0)  # (B*F, C_out, H_pixel, W_pixel)
 
-    # Stack frames: (B, C, F, H, W)
-    video = torch.stack(frames, dim=2)
-    return video
+    # Reshape: (B*F, C, H, W) -> (B, F, C, H, W) -> (B, C, F, H, W)
+    frames = frames.reshape(batch_size, num_frames, *frames.shape[1:])
+    frames = frames.permute(0, 2, 1, 3, 4)
+
+    frames = frames.float()
+    return frames
 
 
 def save_video(frames: torch.Tensor, output_path: str, fps: int) -> None:
@@ -181,10 +225,9 @@ def main() -> None:
     start_load = time.time()
 
     from diffusers import AutoencoderKLTemporalDecoder
-    from diffusers.models import UNetSpatioTemporalConditionModel
     from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
-    # Load image encoder and VAE on rank 0 (or all ranks for simplicity)
+    # Load image encoder and VAE on all ranks for encoding
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
         args.model_id, subfolder="image_encoder", torch_dtype=dtype
     ).to(device)
@@ -207,7 +250,11 @@ def main() -> None:
         model_id=args.model_id,
         timesteps=timesteps,
         torch_dtype=dtype,
+        enable_memory_efficient_attention=True,
+        enable_sliced_attention=True,
+        attention_slice_size="auto",
     ).to(device)
+    model.enable_memory_optimizations()
 
     load_time = time.time() - start_load
     LOGGER.info(f"Models loaded in {load_time:.2f}s")
@@ -232,24 +279,37 @@ def main() -> None:
         noise_aug_strength=args.noise_aug_strength,
     )
 
-    # Set conditioning on model
+    # Free CLIP encoder (no longer needed after encoding)
+    del image_encoder, feature_extractor
+    # Free VAE on non-final ranks (only final rank needs it for decoding)
+    if is_distributed and rank != world_size - 1:
+        del vae
+    torch.cuda.empty_cache()
+    LOGGER.info("Freed encoder models, CUDA cache cleared")
+
+    # Set conditioning on model (with CFG)
     model.set_conditioning(
         image_embeddings=image_embeddings,
         image_latents=image_latents,
         fps=args.fps,
         motion_bucket_id=args.motion_bucket_id,
         noise_aug_strength=args.noise_aug_strength,
+        guidance_scale=args.guidance_scale,
+        num_frames=args.num_frames,
     )
 
-    # Generate initial noise
+    # Generate initial noise (scaled by init_noise_sigma, matching diffusers convention)
     torch.manual_seed(args.seed)
     latents = torch.randn(
-        1, 4, args.num_frames, latent_height, latent_width,
-        device=device, dtype=dtype
+        1, 4, args.num_frames, latent_height, latent_width, device=device, dtype=dtype
     )
+    latents = latents * model.init_noise_sigma
+    LOGGER.info(f"Initial noise scaled by init_noise_sigma={model.init_noise_sigma:.4f}")
 
     # Run diffusion steps
-    LOGGER.info(f"Running {args.total_steps} diffusion steps...")
+    LOGGER.info(
+        f"Running {args.total_steps} diffusion steps (guidance_scale={args.guidance_scale})..."
+    )
     start_diffusion = time.time()
 
     if is_distributed:
@@ -267,9 +327,9 @@ def main() -> None:
 
         # Process local steps
         for step_idx in range(step_range.start, step_range.end):
-            step = timesteps[step_idx] if step_idx < len(timesteps) else step_idx
             step_start = time.time()
             latents = model(latents, step_idx)
+            torch.cuda.empty_cache()
             step_time = (time.time() - step_start) * 1000
             LOGGER.info(f"Rank {rank}: step {step_idx} completed in {step_time:.2f}ms")
 
@@ -283,6 +343,7 @@ def main() -> None:
         for step_idx in range(args.total_steps):
             step_start = time.time()
             latents = model(latents, step_idx)
+            torch.cuda.empty_cache()
             step_time = (time.time() - step_start) * 1000
             if step_idx % 5 == 0 or step_idx == args.total_steps - 1:
                 LOGGER.info(f"Step {step_idx}/{args.total_steps} completed in {step_time:.2f}ms")
@@ -329,6 +390,7 @@ def main() -> None:
         LOGGER.info(f"  Steps: {args.total_steps}")
         LOGGER.info(f"  Frames: {args.num_frames}")
         LOGGER.info(f"  Resolution: {args.width}x{args.height}")
+        LOGGER.info(f"  Guidance scale: {args.guidance_scale}")
         LOGGER.info(f"  Model load time: {load_time:.2f}s")
         LOGGER.info(f"  Diffusion time: {diffusion_time:.2f}s")
         LOGGER.info(f"  Decode time: {decode_time:.2f}s")

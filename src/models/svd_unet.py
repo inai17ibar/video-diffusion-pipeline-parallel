@@ -25,7 +25,8 @@ class StableVideoUNet(nn.Module):
 
     This wrapper handles:
     - Channel concatenation for UNet input
-    - Scheduler step to compute z_{t-1} from noise prediction
+    - Correct EulerDiscreteScheduler step (v_prediction + Karras sigmas)
+    - Classifier-Free Guidance (CFG) with per-frame guidance scale
     - Shape transposition between pipeline and diffusers conventions
 
     Shape Convention:
@@ -59,8 +60,8 @@ class StableVideoUNet(nn.Module):
         self.dtype = dtype
         self.num_train_timesteps = num_train_timesteps
 
-        # Precompute scheduler parameters (Euler Discrete)
-        self._init_scheduler_params()
+        # Initialize scheduler using diffusers EulerDiscreteScheduler
+        self._init_scheduler()
 
         # Conditioning buffers - registered but not persistent
         self.register_buffer("_image_embeddings", None, persistent=False)
@@ -68,26 +69,34 @@ class StableVideoUNet(nn.Module):
         self.register_buffer("_image_latents", None, persistent=False)
         self._conditioning_set = False
 
-    def _init_scheduler_params(self) -> None:
-        """Initialize Euler Discrete scheduler parameters."""
-        # Linear beta schedule
-        beta_start = 0.00085
-        beta_end = 0.012
-        betas = torch.linspace(beta_start, beta_end, self.num_train_timesteps)
-        alphas = 1.0 - betas
-        self.register_buffer(
-            "_alphas_cumprod",
-            torch.cumprod(alphas, dim=0),
-            persistent=False,
+        # CFG state
+        self._guidance_scale = None
+        self._uncond_embeddings = None
+        self._guidance_scale_tensor = None
+
+    def _init_scheduler(self) -> None:
+        """Initialize scheduler using diffusers EulerDiscreteScheduler."""
+        from diffusers import EulerDiscreteScheduler
+
+        scheduler = EulerDiscreteScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            num_train_timesteps=self.num_train_timesteps,
+            prediction_type="v_prediction",
+            interpolation_type="linear",
+            timestep_spacing="leading",
+            steps_offset=1,
+            use_karras_sigmas=True,
         )
-
-        # Compute sigmas for Euler scheduler
-        sigmas = ((1 - self._alphas_cumprod) / self._alphas_cumprod) ** 0.5
-        self.register_buffer("_sigmas", sigmas, persistent=False)
-
-    def _get_sigma(self, timestep: int) -> torch.Tensor:
-        """Get sigma value for a given timestep."""
-        return self._sigmas[timestep]
+        scheduler.set_timesteps(len(self.timesteps))
+        # sigmas: (num_steps + 1,) — last element is 0
+        self.register_buffer("sigmas", scheduler.sigmas.clone(), persistent=False)
+        # Official timesteps computed by the scheduler
+        self.scheduler_timesteps = scheduler.timesteps.clone()
+        # init_noise_sigma: scale factor for initial noise (matches diffusers)
+        # For timestep_spacing="leading": (max_sigma^2 + 1)^0.5
+        self._init_noise_sigma = float((self.sigmas[0] ** 2 + 1) ** 0.5)
 
     @classmethod
     def from_pretrained(
@@ -181,6 +190,11 @@ class StableVideoUNet(nn.Module):
         except Exception:
             pass
 
+    @property
+    def init_noise_sigma(self) -> float:
+        """Scale factor for initial noise (matches diffusers convention)."""
+        return self._init_noise_sigma
+
     @staticmethod
     def _default_timestep_schedule(
         num_steps: int,
@@ -206,6 +220,8 @@ class StableVideoUNet(nn.Module):
         fps: int = 6,
         motion_bucket_id: int = 127,
         noise_aug_strength: float = 0.02,
+        guidance_scale: float | None = None,
+        num_frames: int = 14,
     ) -> None:
         """Set the conditioning inputs for video generation.
 
@@ -218,6 +234,8 @@ class StableVideoUNet(nn.Module):
             fps: Frames per second (will subtract 1 internally)
             motion_bucket_id: Motion bucket ID (typically 127)
             noise_aug_strength: Noise augmentation strength
+            guidance_scale: CFG guidance scale (None or <=1.0 disables CFG)
+            num_frames: Number of video frames (for per-frame guidance scale)
         """
         # Ensure 3D embeddings: (B, seq_len, embed_dim)
         if image_embeddings.dim() == 2:
@@ -240,6 +258,23 @@ class StableVideoUNet(nn.Module):
         self._image_latents = image_latents.to(self.dtype)
         self._conditioning_set = True
 
+        # CFG setup
+        self._guidance_scale = guidance_scale
+        if guidance_scale is not None and guidance_scale > 1.0:
+            # Unconditional: zero CLIP embeddings + zero image_latents
+            self._uncond_embeddings = torch.zeros_like(self._image_embeddings)
+            self._uncond_image_latents = torch.zeros_like(self._image_latents)
+            # Per-frame guidance scale (linear interpolation from 1.0 to max)
+            gs = torch.linspace(1.0, guidance_scale, num_frames)
+            # (1, 1, F, 1, 1) shape for broadcasting with (B, C, F, H, W)
+            self._guidance_scale_tensor = gs.view(1, 1, num_frames, 1, 1).to(
+                device, dtype=self.dtype
+            )
+        else:
+            self._uncond_embeddings = None
+            self._uncond_image_latents = None
+            self._guidance_scale_tensor = None
+
     def set_dummy_conditioning(
         self,
         batch_size: int,
@@ -250,6 +285,7 @@ class StableVideoUNet(nn.Module):
         fps: int = 6,
         motion_bucket_id: int = 127,
         noise_aug_strength: float = 0.02,
+        guidance_scale: float | None = None,
     ) -> None:
         """Set dummy conditioning for benchmarking purposes.
 
@@ -265,6 +301,7 @@ class StableVideoUNet(nn.Module):
             fps: Frames per second
             motion_bucket_id: Motion bucket ID
             noise_aug_strength: Noise augmentation strength
+            guidance_scale: CFG guidance scale (None disables CFG)
         """
         # Generate random CLIP-like embeddings
         image_embeddings = torch.randn(
@@ -293,6 +330,8 @@ class StableVideoUNet(nn.Module):
             fps=fps,
             motion_bucket_id=motion_bucket_id,
             noise_aug_strength=noise_aug_strength,
+            guidance_scale=guidance_scale,
+            num_frames=num_frames,
         )
 
     def clear_conditioning(self) -> None:
@@ -301,9 +340,16 @@ class StableVideoUNet(nn.Module):
         self._added_time_ids = None
         self._image_latents = None
         self._conditioning_set = False
+        self._guidance_scale = None
+        self._uncond_embeddings = None
+        self._uncond_image_latents = None
+        self._guidance_scale_tensor = None
 
+    @torch.inference_mode()
     def forward(self, latent: torch.Tensor, step: int) -> torch.Tensor:
         """Execute a single diffusion step with scheduler update.
+
+        Uses v_prediction with correct scale_model_input and optional CFG.
 
         Args:
             latent: Noisy latent tensor (B, C=4, F, H, W)
@@ -325,42 +371,66 @@ class StableVideoUNet(nn.Module):
         if not (0 <= step < len(self.timesteps)):
             raise ValueError(f"Step {step} out of range [0, {len(self.timesteps)})")
 
-        # Map step index to actual timestep value
-        timestep = self.timesteps[step]
+        sigma = self.sigmas[step]
+        sigma_next = self.sigmas[step + 1]
+        timestep = self.scheduler_timesteps[step]
 
-        # Concatenate latent with image_latents along channel dimension
-        # latent: (B, 4, F, H, W), image_latents: (B, 4, F, H, W)
-        # Result: (B, 8, F, H, W)
-        latent_model_input = torch.cat([latent, self._image_latents], dim=1)
+        # 1. Scale model input: sample / sqrt(sigma^2 + 1)
+        latent_scaled = latent / ((sigma**2 + 1) ** 0.5)
 
-        # Transpose: (B, C=8, F, H, W) -> (B, F, C=8, H, W)
-        sample = latent_model_input.permute(0, 2, 1, 3, 4).to(self.dtype)
+        # 2. Classifier-Free Guidance (sequential for memory efficiency)
+        if self._guidance_scale is not None and self._guidance_scale > 1.0:
+            # Unconditional pass: zero image_latents + zero CLIP embeddings
+            uncond_input = torch.cat([latent_scaled, self._uncond_image_latents], dim=1)
+            uncond_sample = uncond_input.permute(0, 2, 1, 3, 4).to(self.dtype)
+            noise_pred_uncond = self.unet(
+                sample=uncond_sample,
+                timestep=timestep,
+                encoder_hidden_states=self._uncond_embeddings,
+                added_time_ids=self._added_time_ids,
+                return_dict=False,
+            )[0]
 
-        # Forward through the actual UNet - returns noise prediction
-        noise_pred = self.unet(
-            sample=sample,
-            timestep=timestep,
-            encoder_hidden_states=self._image_embeddings,
-            added_time_ids=self._added_time_ids,
-            return_dict=False,
-        )[0]
+            # Conditional pass: real image_latents + real CLIP embeddings
+            cond_input = torch.cat([latent_scaled, self._image_latents], dim=1)
+            cond_sample = cond_input.permute(0, 2, 1, 3, 4).to(self.dtype)
+            noise_pred_cond = self.unet(
+                sample=cond_sample,
+                timestep=timestep,
+                encoder_hidden_states=self._image_embeddings,
+                added_time_ids=self._added_time_ids,
+                return_dict=False,
+            )[0]
 
-        # Transpose back: (B, F, C=4, H, W) -> (B, C=4, F, H, W)
+            # Apply guidance (per-frame scale)
+            # noise_pred: (B, F, C=4, H, W), guidance_scale_tensor needs permute
+            gs = self._guidance_scale_tensor.permute(0, 2, 1, 3, 4)  # (1, F, 1, 1, 1)
+            noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
+        else:
+            # No CFG: real image_latents + real CLIP embeddings
+            latent_model_input = torch.cat([latent_scaled, self._image_latents], dim=1)
+            sample = latent_model_input.permute(0, 2, 1, 3, 4).to(self.dtype)
+            noise_pred = self.unet(
+                sample=sample,
+                timestep=timestep,
+                encoder_hidden_states=self._image_embeddings,
+                added_time_ids=self._added_time_ids,
+                return_dict=False,
+            )[0]
+
+        # 5. Transpose back: (B, F, C=4, H, W) -> (B, C=4, F, H, W)
         noise_pred = noise_pred.permute(0, 2, 1, 3, 4)
 
-        # Apply Euler scheduler step to get z_{t-1}
-        # Simplified Euler step: z_{t-1} = z_t - sigma * noise_pred
-        sigma = self._get_sigma(timestep).to(latent.device)
+        # 6. V-prediction Euler step (fp32 for numerical stability)
+        latent_f32 = latent.float()
+        noise_pred_f32 = noise_pred.float()
+        sigma_f32 = sigma.float()
 
-        # Get next sigma (or 0 if this is the last step)
-        if step < len(self.timesteps) - 1:
-            next_timestep = self.timesteps[step + 1]
-            sigma_next = self._get_sigma(next_timestep).to(latent.device)
-        else:
-            sigma_next = torch.tensor(0.0, device=latent.device)
+        pred_original_sample = noise_pred_f32 * (
+            -sigma_f32 / (sigma_f32**2 + 1) ** 0.5
+        ) + latent_f32 / (sigma_f32**2 + 1)
+        derivative = (latent_f32 - pred_original_sample) / sigma_f32
+        dt = float(sigma_next) - float(sigma)
+        prev_sample = latent_f32 + derivative * dt
 
-        # Euler step
-        dt = sigma_next - sigma
-        latent_next = latent + dt * noise_pred
-
-        return latent_next
+        return prev_sample.to(self.dtype)

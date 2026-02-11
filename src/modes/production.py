@@ -122,9 +122,14 @@ def main() -> None:
         shape=torch.Size(tuple(args.latent_shape)), dtype=torch.float16, device=device
     )
 
+    init_noise_sigma = model.init_noise_sigma
+
     def _input_supplier(sample_idx: int) -> torch.Tensor:
         torch.manual_seed(args.seed + sample_idx)
-        return torch.randn(latent_spec.shape, device=device, dtype=latent_spec.dtype)
+        return (
+            torch.randn(latent_spec.shape, device=device, dtype=latent_spec.dtype)
+            * init_noise_sigma
+        )
 
     run_pipeline_latents(
         model,
