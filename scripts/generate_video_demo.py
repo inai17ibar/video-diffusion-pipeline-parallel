@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--noise-aug-strength", type=float, default=0.02, help="Noise augmentation strength"
     )
+    parser.add_argument("--num-samples", type=int, default=4, help="Number of samples to generate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--height", type=int, default=576, help="Output height")
     parser.add_argument("--width", type=int, default=1024, help="Output width")
@@ -129,10 +130,20 @@ def encode_image(
         noise = torch.randn_like(image_tensor)
         image_tensor = image_tensor + noise_aug_strength * noise
 
+    # Upcast VAE to fp32 if force_upcast is enabled (matches official diffusers pipeline)
+    needs_upcast = getattr(vae.config, "force_upcast", False) and vae.dtype == torch.float16
+    if needs_upcast:
+        vae.to(dtype=torch.float32)
+        image_tensor = image_tensor.to(dtype=torch.float32)
+
     with torch.no_grad():
         # Use .mode() for deterministic encoding (official pipeline convention)
         # Do NOT multiply by scaling_factor — image_latents are raw VAE latents
         image_latents = vae.encode(image_tensor).latent_dist.mode()
+
+    if needs_upcast:
+        vae.to(dtype=torch.float16)
+        image_latents = image_latents.to(dtype=dtype)
 
     # Repeat for all frames: (B, C, H, W) -> (B, C, F, H, W)
     image_latents = image_latents.unsqueeze(2).repeat(1, 1, num_frames, 1, 1)
@@ -158,6 +169,12 @@ def decode_latents(
     latents = latents.flatten(0, 1)  # (B*F, C, H, W)
     latents = latents / vae.config.scaling_factor
 
+    # Upcast VAE to fp32 if force_upcast is enabled (matches official diffusers pipeline)
+    needs_upcast = getattr(vae.config, "force_upcast", False) and vae.dtype == torch.float16
+    if needs_upcast:
+        vae.to(dtype=torch.float32)
+        latents = latents.to(dtype=torch.float32)
+
     # Decode in chunks (all frames together for temporal coherence)
     frames = []
     with torch.no_grad():
@@ -166,6 +183,9 @@ def decode_latents(
             frame = vae.decode(chunk, num_frames=chunk.shape[0]).sample
             frames.append(frame)
     frames = torch.cat(frames, dim=0)  # (B*F, C_out, H_pixel, W_pixel)
+
+    if needs_upcast:
+        vae.to(dtype=torch.float16)
 
     # Reshape: (B*F, C, H, W) -> (B, F, C, H, W) -> (B, C, F, H, W)
     frames = frames.reshape(batch_size, num_frames, *frames.shape[1:])
@@ -298,102 +318,146 @@ def main() -> None:
         num_frames=args.num_frames,
     )
 
-    # Generate initial noise (scaled by init_noise_sigma, matching diffusers convention)
-    torch.manual_seed(args.seed)
-    latents = torch.randn(
-        1, 4, args.num_frames, latent_height, latent_width, device=device, dtype=dtype
-    )
-    latents = latents * model.init_noise_sigma
-    LOGGER.info(f"Initial noise scaled by init_noise_sigma={model.init_noise_sigma:.4f}")
-
-    # Run diffusion steps
-    LOGGER.info(
-        f"Running {args.total_steps} diffusion steps (guidance_scale={args.guidance_scale})..."
-    )
-    start_diffusion = time.time()
-
+    # Compute step assignment once (reused for all samples)
     if is_distributed:
-        # Pipeline parallel execution
         from src.pipeline.step_assignment import assign_steps
 
         step_range = assign_steps(args.total_steps, world_size, rank)
         LOGGER.info(f"Rank {rank}: processing steps {step_range.start} to {step_range.end - 1}")
 
-        # Receive from previous rank (if not first)
-        if rank > 0:
-            latents = torch.empty_like(latents)
-            dist.recv(latents, src=rank - 1)
-            LOGGER.info(f"Rank {rank}: received latents from rank {rank - 1}")
-
-        # Process local steps
-        for step_idx in range(step_range.start, step_range.end):
-            step_start = time.time()
-            latents = model(latents, step_idx)
-            torch.cuda.empty_cache()
-            step_time = (time.time() - step_start) * 1000
-            LOGGER.info(f"Rank {rank}: step {step_idx} completed in {step_time:.2f}ms")
-
-        # Send to next rank (if not last)
-        if rank < world_size - 1:
-            dist.send(latents, dst=rank + 1)
-            LOGGER.info(f"Rank {rank}: sent latents to rank {rank + 1}")
-
-    else:
-        # Single GPU execution
-        for step_idx in range(args.total_steps):
-            step_start = time.time()
-            latents = model(latents, step_idx)
-            torch.cuda.empty_cache()
-            step_time = (time.time() - step_start) * 1000
-            if step_idx % 5 == 0 or step_idx == args.total_steps - 1:
-                LOGGER.info(f"Step {step_idx}/{args.total_steps} completed in {step_time:.2f}ms")
-
-    diffusion_time = time.time() - start_diffusion
-    LOGGER.info(f"Diffusion completed in {diffusion_time:.2f}s")
-
-    # Only last rank (or single GPU) decodes and saves
+    # Prepare output directory and naming
+    output_dir = Path(args.output_dir)
     if rank == world_size - 1:
-        LOGGER.info("Decoding latents to video frames...")
-        start_decode = time.time()
-        video_frames = decode_latents(latents, vae, args.num_frames)
-        decode_time = time.time() - start_decode
-        LOGGER.info(f"Decoding completed in {decode_time:.2f}s")
-
-        # Save output
-        output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+    input_name = Path(args.input_image).stem
+    timestamp = int(time.time())
 
-        input_name = Path(args.input_image).stem
-        timestamp = int(time.time())
+    num_samples = args.num_samples
+    total_diffusion_time = 0.0
+    total_decode_time = 0.0
+    # Store completed latents on CPU and their seed info for later decoding
+    sample_results: list[tuple[torch.Tensor, int, int]] = []  # (latents_cpu, sample_idx, seed)
 
-        # Save MP4
-        mp4_path = output_dir / f"{input_name}_svd_{world_size}gpu_{timestamp}.mp4"
-        save_video(video_frames, str(mp4_path), args.fps)
+    LOGGER.info(f"Generating {num_samples} samples...")
 
-        # Save GIF
-        gif_path = output_dir / f"{input_name}_svd_{world_size}gpu_{timestamp}.gif"
-        save_gif(video_frames, str(gif_path), args.fps)
+    # Phase 1: Run diffusion for all samples (UNet on GPU)
+    for sample_idx in range(num_samples):
+        sample_seed = args.seed + sample_idx
+        LOGGER.info(f"--- Sample {sample_idx + 1}/{num_samples} (seed={sample_seed}) ---")
 
-        # Save input image for comparison
+        # Generate initial noise on rank 0, broadcast to others via send/recv
+        latent_shape = (1, 4, args.num_frames, latent_height, latent_width)
+        if is_distributed:
+            if rank == 0:
+                torch.manual_seed(sample_seed)
+                latents = torch.randn(*latent_shape, device=device, dtype=dtype)
+                latents = latents * model.init_noise_sigma
+            else:
+                latents = torch.empty(*latent_shape, device=device, dtype=dtype)
+        else:
+            torch.manual_seed(sample_seed)
+            latents = torch.randn(*latent_shape, device=device, dtype=dtype)
+            latents = latents * model.init_noise_sigma
+
+        LOGGER.info(f"Initial noise scaled by init_noise_sigma={model.init_noise_sigma:.4f}")
+
+        # Run diffusion steps
+        LOGGER.info(
+            f"Running {args.total_steps} diffusion steps (guidance_scale={args.guidance_scale})..."
+        )
+        start_diffusion = time.time()
+
+        if is_distributed:
+            # Receive from previous rank (if not first)
+            if rank > 0:
+                dist.recv(latents, src=rank - 1)
+                LOGGER.info(f"Rank {rank}: received latents from rank {rank - 1}")
+
+            # Process local steps
+            for step_idx in range(step_range.start, step_range.end):
+                step_start = time.time()
+                latents = model(latents, step_idx)
+                torch.cuda.empty_cache()
+                step_time = (time.time() - step_start) * 1000
+                LOGGER.info(f"Rank {rank}: step {step_idx} completed in {step_time:.2f}ms")
+
+            # Send to next rank (if not last)
+            if rank < world_size - 1:
+                dist.send(latents, dst=rank + 1)
+                LOGGER.info(f"Rank {rank}: sent latents to rank {rank + 1}")
+
+        else:
+            # Single GPU execution
+            for step_idx in range(args.total_steps):
+                step_start = time.time()
+                latents = model(latents, step_idx)
+                torch.cuda.empty_cache()
+                step_time = (time.time() - step_start) * 1000
+                if step_idx % 5 == 0 or step_idx == args.total_steps - 1:
+                    LOGGER.info(
+                        f"Step {step_idx}/{args.total_steps} completed in {step_time:.2f}ms"
+                    )
+
+        diffusion_time = time.time() - start_diffusion
+        total_diffusion_time += diffusion_time
+        LOGGER.info(f"Diffusion completed in {diffusion_time:.2f}s")
+
+        # Save latents to CPU for later decoding (only on final rank)
+        if rank == world_size - 1:
+            sample_results.append((latents.cpu(), sample_idx, sample_seed))
+
+    # Phase 2: Free UNet, then decode all samples with VAE
+    del model
+    torch.cuda.empty_cache()
+    LOGGER.info("Freed UNet model for decoding")
+
+    if rank == world_size - 1:
+        for latents_cpu, sample_idx, sample_seed in sample_results:
+            LOGGER.info(f"--- Decoding sample {sample_idx + 1}/{num_samples} ---")
+            start_decode = time.time()
+            video_frames = decode_latents(
+                latents_cpu.to(device), vae, args.num_frames, decode_chunk_size=4
+            )
+            decode_time = time.time() - start_decode
+            total_decode_time += decode_time
+            LOGGER.info(f"Decoding completed in {decode_time:.2f}s")
+
+            # Save MP4
+            mp4_name = (
+                f"{input_name}_svd_{world_size}gpu_s{sample_idx}_seed{sample_seed}_{timestamp}.mp4"
+            )
+            mp4_path = output_dir / mp4_name
+            save_video(video_frames, str(mp4_path), args.fps)
+
+            # Save GIF
+            gif_name = (
+                f"{input_name}_svd_{world_size}gpu_s{sample_idx}_seed{sample_seed}_{timestamp}.gif"
+            )
+            gif_path = output_dir / gif_name
+            save_gif(video_frames, str(gif_path), args.fps)
+
+    # Save input image for comparison (once, after all samples)
+    if rank == world_size - 1:
         input_copy_path = output_dir / f"{input_name}_input_{timestamp}.png"
         image.save(str(input_copy_path))
         LOGGER.info(f"Input image saved to: {input_copy_path}")
 
         # Print summary
-        total_time = load_time + diffusion_time + decode_time
+        total_time = load_time + total_diffusion_time + total_decode_time
         LOGGER.info("=" * 50)
         LOGGER.info("Generation Summary")
         LOGGER.info("=" * 50)
         LOGGER.info(f"  Input: {args.input_image}")
-        LOGGER.info(f"  Output: {mp4_path}")
+        LOGGER.info(f"  Output dir: {output_dir}")
+        LOGGER.info(f"  Samples: {num_samples}")
         LOGGER.info(f"  GPUs: {world_size}")
         LOGGER.info(f"  Steps: {args.total_steps}")
         LOGGER.info(f"  Frames: {args.num_frames}")
         LOGGER.info(f"  Resolution: {args.width}x{args.height}")
         LOGGER.info(f"  Guidance scale: {args.guidance_scale}")
         LOGGER.info(f"  Model load time: {load_time:.2f}s")
-        LOGGER.info(f"  Diffusion time: {diffusion_time:.2f}s")
-        LOGGER.info(f"  Decode time: {decode_time:.2f}s")
+        LOGGER.info(f"  Total diffusion time: {total_diffusion_time:.2f}s")
+        LOGGER.info(f"  Total decode time: {total_decode_time:.2f}s")
         LOGGER.info(f"  Total time: {total_time:.2f}s")
         LOGGER.info("=" * 50)
 

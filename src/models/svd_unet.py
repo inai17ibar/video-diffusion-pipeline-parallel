@@ -86,8 +86,11 @@ class StableVideoUNet(nn.Module):
             prediction_type="v_prediction",
             interpolation_type="linear",
             timestep_spacing="leading",
+            timestep_type="continuous",
             steps_offset=1,
             use_karras_sigmas=True,
+            sigma_min=0.002,
+            sigma_max=700.0,
         )
         scheduler.set_timesteps(len(self.timesteps))
         # sigmas: (num_steps + 1,) — last element is 0

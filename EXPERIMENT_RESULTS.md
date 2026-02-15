@@ -207,7 +207,89 @@ The pipeline parallel infrastructure is **fully functional** and verified with b
 4. **Communication overhead**: Minimal P2P latency between ranks
 
 ### Remaining Opportunities
-1. Implement multi-sample pipeline filling for higher throughput
+1. Run multi-GPU multi-sample throughput measurement
 2. Add CUDA events for precise timing measurements
 3. Consider model sharding for even larger frame counts
-4. Add proper image conditioning (currently using dummy conditioning)
+
+---
+
+## 10. Experiment: Multi-Sample Generation + Quality Fix (2026-02-15)
+
+### Objective
+
+1. Add multi-sample generation (different seeds) in a single run
+2. Improve encode/decode quality via VAE fp32 upcasting
+3. Fix scheduler parameters to match official pipeline for correct video quality
+
+### Changes
+
+#### 10.1 `scripts/generate_video_demo.py`
+
+- **`--num-samples` argument**: Default 4, generates multiple videos with different seeds
+- **VAE fp32 upcast**: `encode_image()` and `decode_latents()` temporarily cast VAE to fp32 when `force_upcast=True`, matching official diffusers behavior
+- **2-phase approach**: Phase 1 runs all diffusion samples (saves latents to CPU), Phase 2 frees UNet then decodes with VAE (avoids OOM)
+- **Decode chunk size**: Reduced from 14 to 4 (prevents OOM during fp32 VAE decode)
+
+#### 10.2 `src/models/svd_unet.py` Scheduler Fix (Root Cause of Quality Issue)
+
+**Problem**: Scheduler `sigma_min`/`sigma_max` parameters were not specified, causing a massive deviation from the official SVD model configuration.
+
+| Parameter | Before (default) | After (official match) |
+|-----------|-------------------|----------------------|
+| `sigma_min` | unset | 0.002 |
+| `sigma_max` | unset | 700.0 |
+| `timestep_type` | unset | `"continuous"` |
+| `sigmas[0]` | 11.68 | **700.0** |
+| `init_noise_sigma` | 11.72 | **700.0** |
+
+This caused the entire noise schedule to differ from official, resulting in videos that were unrelated noisy artifacts instead of coherent motion from the input image.
+
+**Post-fix verification**:
+```
+sigmas[0]: 700.0000 (exact match with official)
+All timesteps and sigmas match official scheduler (diff < 1e-6)
+```
+
+### Results
+
+#### Single GPU, 1 Sample Test
+
+| Metric | Value |
+|--------|-------|
+| GPU | 1x RTX A5000 |
+| Steps | 25 |
+| Frames | 14 |
+| Resolution | 1024x576 |
+| CFG Scale | 1.0 to 3.0 |
+| Seed | 42 |
+| Diffusion time | 47.65s |
+| Decode time | 4.90s |
+| Total time | 59.59s |
+
+#### Output File Size Comparison
+
+| Pipeline | MP4 Size | Notes |
+|----------|----------|-------|
+| Official (`run_official_pipeline.py`) | 216KB | Baseline |
+| Official encode/decode + custom loop (`generate_video_use_pipe.py`) | 245KB | Near-official quality |
+| **Before fix** (`generate_video_demo.py`) | 531KB | Noisy output |
+| **After fix** (`generate_video_demo.py`) | **341KB** | Significant improvement |
+
+Reduced file size indicates cleaner, less noisy video output.
+
+#### Output Files
+
+```
+outputs/
+├── demo_input_photo_input_1771119935.png               # Input image
+├── demo_input_photo_svd_1gpu_s0_seed42_1771119935.mp4  # Generated video (341KB)
+└── demo_input_photo_svd_1gpu_s0_seed42_1771119935.gif  # GIF version (4.3MB)
+```
+
+### Technical Detail: OOM Mitigation
+
+fp32 VAE decode of 14 frames requires 7.88 GiB, causing OOM. Mitigations:
+
+1. **2-phase approach**: Free UNet after all diffusion completes, reclaim memory for VAE decode
+2. **Chunked decode**: `decode_chunk_size=4` decodes 14 frames in chunks of 4
+3. **CPU offload**: Diffused latents cached on CPU, VAE decodes in fp32 on CPU
