@@ -16,7 +16,7 @@ set -e
 TOTAL_STEPS=28          # 1, 2, 4, 7 で割り切れる
 NUM_SAMPLES=14          # 全GPU数(7)で割り切れる数
 WARMUP_SAMPLES=7        # ウォームアップ（7で割り切れる）
-MODEL="dummy"           # dummy or svd
+MODEL="${MODEL:-dummy}"  # dummy or svd (override: MODEL=svd bash ...)
 SEED=42
 LATENT_HEIGHT=40
 LATENT_WIDTH=72

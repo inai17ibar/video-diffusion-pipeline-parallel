@@ -1,0 +1,9 @@
+mode,gpu_count,total_steps,steps_per_gpu,num_samples,first_sample_s,avg_sample_s,throughput_sps
+pipeline_parallel,1,28,28,14,8.7223,8.4873,0.1178
+data_parallel,1,28,28,14,8.5241,8.5444,0.117
+pipeline_parallel,2,28,14,14,9.5047,4.275,0.2339
+data_parallel,2,28,28,14,8.5124,8.534,0.2344
+pipeline_parallel,4,28,7,14,10.9166,2.0405,0.4901
+data_parallel,4,28,28,14,8.5381,8.5537,0.4092
+pipeline_parallel,7,28,4,14,13.1161,1.1693,0.8552
+data_parallel,7,28,28,14,8.5588,8.5649,0.8173
