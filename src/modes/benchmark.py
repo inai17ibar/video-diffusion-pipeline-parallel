@@ -52,6 +52,7 @@ def _parse_args() -> argparse.Namespace:
         choices=["auto", "gloo", "nccl"],
     )
     parser.add_argument("--init-method", type=str, default=None)
+    parser.add_argument("--guidance-scale", type=float, default=None)
     return parser.parse_args()
 
 
@@ -90,13 +91,13 @@ def _build_svd_model(args, device, total_steps):
     ).to(device)
     model.enable_memory_optimizations()
 
-    # Set dummy conditioning (no CFG for clean throughput measurement)
     model.set_dummy_conditioning(
         batch_size=1,
         num_frames=args.latent_frames,
         height=args.latent_height,
         width=args.latent_width,
         device=device,
+        guidance_scale=args.guidance_scale,
     )
     return model
 
