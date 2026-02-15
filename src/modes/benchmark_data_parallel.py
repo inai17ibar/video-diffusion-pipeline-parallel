@@ -151,34 +151,42 @@ def main() -> None:
 
     init_noise_sigma = model.init_noise_sigma if use_svd else 1.0
 
-    # Distribute samples across ranks
-    total_samples = args.warmup_samples + args.num_samples
-    if total_samples % world_size != 0:
-        # Round up so every rank processes the same number
-        samples_per_rank = (total_samples + world_size - 1) // world_size
+    # Distribute measured samples across ranks
+    if args.num_samples % world_size != 0:
+        measured_per_rank = (args.num_samples + world_size - 1) // world_size
     else:
-        samples_per_rank = total_samples // world_size
-
-    my_start = rank * samples_per_rank
-    my_end = min(my_start + samples_per_rank, total_samples)
-    my_count = my_end - my_start
+        measured_per_rank = args.num_samples // world_size
 
     LOGGER.info(
-        "Rank %d: processing samples [%d, %d) (%d samples, %d total steps each)",
+        "Rank %d: %d warmup + %d measured samples, %d total steps each",
         rank,
-        my_start,
-        my_end,
-        my_count,
+        args.warmup_samples,
+        measured_per_rank,
         args.total_steps,
     )
 
-    # Synchronize before timing
+    # --- Phase 1: Warmup (each rank runs warmup_samples locally) ---
+    LOGGER.info("Rank %d: running %d warmup samples...", rank, args.warmup_samples)
     torch.cuda.synchronize(device)
     dist.barrier()
 
-    # Each rank independently processes its samples
+    with torch.no_grad():
+        for wi in range(args.warmup_samples):
+            torch.manual_seed(args.seed + rank * 10000 + wi)
+            latent = torch.randn(latent_shape, device=device, dtype=dtype) * init_noise_sigma
+            _run_all_steps(model, latent, args.total_steps)
+
+    torch.cuda.synchronize(device)
+    dist.barrier()
+    LOGGER.info("Rank %d: warmup complete", rank)
+
+    # --- Phase 2: Measured (each rank processes its share) ---
+    my_start = rank * measured_per_rank
+    my_end = min(my_start + measured_per_rank, args.num_samples)
+    my_count = my_end - my_start
+
     per_sample_times: list[float] = []
-    overall_start = time.perf_counter()
+    measured_start = time.perf_counter()
 
     with torch.no_grad():
         for sample_idx in range(my_start, my_end):
@@ -186,20 +194,19 @@ def main() -> None:
 
             torch.manual_seed(args.seed + sample_idx)
             latent = torch.randn(latent_shape, device=device, dtype=dtype) * init_noise_sigma
-
             _run_all_steps(model, latent, args.total_steps)
 
             torch.cuda.synchronize(device)
             per_sample_times.append(time.perf_counter() - sample_start)
 
-    overall_elapsed = time.perf_counter() - overall_start
+    measured_elapsed = time.perf_counter() - measured_start
 
-    # Synchronize after processing
+    # Synchronize after measurement
     dist.barrier()
 
-    # Gather timing from all ranks to rank 0
+    # Gather timing from all ranks to rank 0 via send/recv
     timing_tensor = torch.tensor(
-        [overall_elapsed, float(my_count)], device=device, dtype=torch.float64
+        [measured_elapsed, float(my_count)], device=device, dtype=torch.float64
     )
 
     if rank == 0:
@@ -214,29 +221,12 @@ def main() -> None:
 
     # Rank 0 reports results
     if rank == 0:
-        # The wall-clock time is the max across all ranks
+        # Wall-clock time is the max across all ranks (all start together after barrier)
         max_elapsed = max(t[0].item() for t in all_timings)
-        total_processed = sum(int(t[1].item()) for t in all_timings)
+        total_measured = sum(int(t[1].item()) for t in all_timings)
 
-        # Measured samples = total minus warmup
-        measured_count = total_processed - args.warmup_samples
-        if measured_count <= 0:
-            measured_count = total_processed
-
-        # Use rank 0's own per-sample times for detailed reporting
-        # Separate warmup from measured on this rank
-        local_warmup = min(args.warmup_samples - my_start, my_count)
-        local_warmup = max(local_warmup, 0)
-        local_measured_times = per_sample_times[local_warmup:]
-
-        avg_sample_time = (
-            sum(local_measured_times) / len(local_measured_times) if local_measured_times else 0.0
-        )
-        # Throughput: total measured samples / wall-clock time for measured portion
-        # Wall-clock time for measured = max_elapsed - warmup time
-        # Approximate: use overall throughput
-        throughput = args.num_samples / max_elapsed if max_elapsed > 0 else 0.0
-
+        avg_sample_time = sum(per_sample_times) / len(per_sample_times) if per_sample_times else 0.0
+        throughput = total_measured / max_elapsed if max_elapsed > 0 else 0.0
         first_sample_time = per_sample_times[0] if per_sample_times else 0.0
 
         results = {
@@ -245,8 +235,9 @@ def main() -> None:
             "total_steps": args.total_steps,
             "steps_per_gpu": args.total_steps,
             "model": args.model,
-            "num_samples_measured": args.num_samples,
+            "num_samples_measured": total_measured,
             "warmup_samples": args.warmup_samples,
+            "samples_per_rank": measured_per_rank,
             "latent_shape": list(latent_shape),
             "first_sample_time_s": round(first_sample_time, 4),
             "avg_sample_time_s": round(avg_sample_time, 4),
@@ -259,19 +250,19 @@ def main() -> None:
         LOGGER.info("DATA PARALLEL BENCHMARK RESULTS")
         LOGGER.info("=" * 70)
         LOGGER.info(
-            "GPUs: %d | Steps/GPU: %d (all) | Model: %s | Samples: %d (+ %d warmup)",
+            "GPUs: %d | Steps/GPU: %d (all) | Model: %s | Samples: %d (+ %d warmup/rank)",
             world_size,
             args.total_steps,
             args.model,
-            args.num_samples,
+            total_measured,
             args.warmup_samples,
         )
         LOGGER.info("Latent: %s (%s)", list(latent_shape), dtype)
-        LOGGER.info("Samples per rank: ~%d", samples_per_rank)
+        LOGGER.info("Samples per rank: %d", measured_per_rank)
         LOGGER.info("-" * 70)
         LOGGER.info("First sample (rank 0): %.2f s", first_sample_time)
         LOGGER.info("Avg sample (rank 0):   %.4f s", avg_sample_time)
-        LOGGER.info("Wall clock:            %.4f s", max_elapsed)
+        LOGGER.info("Wall clock (measured): %.4f s", max_elapsed)
         LOGGER.info("Throughput:            %.4f samples/s", throughput)
         LOGGER.info("-" * 70)
         LOGGER.info(
